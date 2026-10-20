@@ -1,0 +1,139 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS GITHUB BULK UPLOADER
+Décompresse un fichier .zip/.tar.xz/.lzma et l'envoie sur GitHub en 1 commit.
+Contourne la limite de l'interface web.
+"""
+import os
+import sys
+import json
+import zipfile
+import tarfile
+import lzma
+import base64
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER = os.environ.get("GITHUB_USER", "")
+REPO_NAME = os.environ.get("REPO_NAME", "mon-super-repo")
+BRANCH = "main"
+
+def api_call(method, endpoint, data=None):
+url = f"https://api.github.com/repos/{GITHUB_USER}/{REPO_NAME}{endpoint}"
+req = urllib.request.Request(url, method=method)
+req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+req.add_header("Accept", "application/vnd.github.v3+json")
+req.add_header("User-Agent", "NexusBulkUploader/1.0")
+
+if data:
+req.add_header("Content-Type", "application/json")
+req.data = json.dumps(data).encode()
+
+try:
+with urllib.request.urlopen(req) as r:
+return json.loads(r.read().decode())
+except urllib.error.HTTPError as e:
+print(f"[ERR] {e.code} : {e.read().decode()}")
+return None
+
+def extraire_archive(path):
+"""Extrait le contenu d'une archive en mémoire."""
+fichiers = {}
+path = Path(path)
+
+if path.suffix == ".zip":
+with zipfile.ZipFile(path, 'r') as z:
+for name in z.namelist():
+if not name.endswith('/'):
+fichiers[name] = z.read(name)
+elif path.suffix in [".xz", ".lzma"] or path.name.endswith(".tar.xz"):
+with tarfile.open(path, 'r:*') as t:
+for member in t.getmembers():
+if member.isfile():
+f = t.extractfile(member)
+if f:
+fichiers[member.name] = f.read()
+elif path.suffix in [".gz", ".tgz"] or path.name.endswith(".tar.gz"):
+with tarfile.open(path, 'r:gz') as t:
+for member in t.getmembers():
+if member.isfile():
+f = t.extractfile(member)
+if f:
+fichiers[member.name] = f.read()
+return fichiers
+
+def uploader(fichiers):
+print(f"[*] Récupération de la référence de la branche {BRANCH}...")
+ref = api_call("GET", f"/git/refs/heads/{BRANCH}")
+if not ref:
+print("[ERR] Impossible de trouver la branche. Vérifie le nom (main ou master).")
+return
+parent_sha = ref["object"]["sha"]
+
+print(f"[*] Création des blobs pour {len(fichiers)} fichiers...")
+tree_items = []
+for name, content in fichiers.items():
+blob = api_call("POST", "/git/blobs", {
+"content": base64.b64encode(content).decode(),
+"encoding": "base64"
+})
+if blob:
+tree_items.append({
+"path": name,
+"mode": "100644",
+"type": "blob",
+"sha": blob["sha"]
+})
+
+print("[*] Création de l'arbre (tree)...")
+tree = api_call("POST", "/git/trees", {
+"base_tree": api_call("GET", f"/git/commits/{parent_sha}")["tree"]["sha"],
+"tree": tree_items
+})
+if not tree:
+return
+
+print("[*] Création du commit...")
+commit = api_call("POST", "/git/commits", {
+"message": f"Nexus Bulk Upload : {len(fichiers)} fichiers",
+"tree": tree["sha"],
+"parents": [parent_sha]
+})
+if not commit:
+return
+
+print("[*] Mise à jour de la branche...")
+update = api_call("PATCH", f"/git/refs/heads/{BRANCH}", {
+"sha": commit["sha"]
+})
+
+if update:
+print(f"[OK] {len(fichiers)} fichiers uploadés en 1 commit !")
+print(f" Commit SHA : {commit['sha'][:10]}")
+else:
+print("[ERR] Échec de la mise à jour de la branche.")
+
+def main():
+if len(sys.argv) < 2:
+print("Usage: python3 nexus_bulk_upload.py <archive.zip|tar.xz>")
+return
+
+if not GITHUB_TOKEN or not GITHUB_USER:
+print("[ERR] Définis les variables d'environnement GITHUB_TOKEN et GITHUB_USER.")
+return
+
+archive_path = sys.argv[1]
+print(f"[*] Extraction de {archive_path}...")
+fichiers = extraire_archive(archive_path)
+
+if not fichiers:
+print("[ERR] Aucun fichier extrait.")
+return
+
+print(f"[OK] {len(fichiers)} fichiers extraits en mémoire.")
+uploader(fichiers)
+
+if __name__ == "__main__":
+main()
