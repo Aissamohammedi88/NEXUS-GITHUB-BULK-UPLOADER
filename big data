@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NEXUS GITHUB BULK UPLOADER X2
+Objectif : Uploader un dossier/archive massif sur GitHub en 1 commit.
+Architecture : Streaming par lots + Gestion du Rate Limit + Arborescence préservée.
+Auteur : Aissa Mohammedi (DGK) - NEXUS-OPEN-3.0
+"""
+
+import os
+import sys
+import json
+import time
+import zipfile
+import tarfile
+import base64
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# --- CONFIGURATION ---
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER = os.environ.get("GITHUB_USER", "")
+REPO_NAME = os.environ.get("REPO_NAME", "Nexus-Mass-Upload")
+BRANCH = os.environ.get("BRANCH", "main")
+BATCH_SIZE = 50  # Nombre de fichiers par lot (pour éviter de saturer l'API)
+
+def api_call(method, endpoint, data=None, retries=3):
+    """Appel API avec gestion du Rate Limit (403) et des erreurs réseau."""
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{REPO_NAME}{endpoint}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+    req.add_header("Accept", "application/vnd.github.v3+json")
+    req.add_header("User-Agent", "NexusBulkUploader/2.0")
+
+    if data:
+        req.add_header("Content-Type", "application/json")
+        req.data = json.dumps(data).encode()
+
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                print(f"[!] Rate limit atteint. Pause de 60s (Tentative {attempt+1}/{retries})...")
+                time.sleep(60)
+                continue
+            print(f"[ERR] {e.code} sur {endpoint} : {e.read().decode()}")
+            return None
+        except Exception as e:
+            print(f"[ERR] Réseau : {e}")
+            time.sleep(5)
+            continue
+    return None
+
+def extraire_archive(path):
+    """Générateur (yield) pour lire les fichiers un par un sans saturer la RAM."""
+    path = Path(path)
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path, 'r') as z:
+            for name in z.namelist():
+                if not name.endswith('/'):
+                    yield name, z.read(name)
+    elif path.name.endswith((".tar.xz", ".tar.gz", ".tgz")):
+        mode = 'r:xz' if ".xz" in path.name else 'r:gz'
+        with tarfile.open(path, mode) as t:
+            for member in t.getmembers():
+                if member.isfile():
+                    f = t.extractfile(member)
+                    if f:
+                        yield member.name, f.read()
+
+def uploader(fichiers_generator):
+    print(f"[*] Récupération de la référence de la branche {BRANCH}...")
+    ref = api_call("GET", f"/git/refs/heads/{BRANCH}")
+    if not ref:
+        print(f"[ERR] Impossible de trouver la branche '{BRANCH}'. Vérifie le nom (main ou master).")
+        return
+    parent_sha = ref["object"]["sha"]
+
+    print("[*] Récupération de l'arbre actuel...")
+    commit_data = api_call("GET", f"/git/commits/{parent_sha}")
+    if not commit_data:
+        return
+    base_tree_sha = commit_data["tree"]["sha"]
+
+    tree_items = []
+    total_envoyes = 0
+
+    print("[*] Création des blobs par lots (pour éviter l'OOM)...")
+    
+    for name, content in fichiers_generator:
+        # 1. Création du blob (le contenu du fichier)
+        blob = api_call("POST", "/git/blobs", {
+            "content": base64.b64encode(content).decode(),
+            "encoding": "base64"
+        })
+        
+        if blob:
+            tree_items.append({
+                "path": name,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob["sha"]
+            })
+            total_envoyes += 1
+            print(f"    [+] {name} ({len(content)} octets)")
+        else:
+            print(f"    [-] Échec pour {name}")
+
+        # 2. Si on atteint la taille du lot, on crée un arbre intermédiaire
+        if len(tree_items) >= BATCH_SIZE:
+            print(f"[*] Création de l'arbre pour le lot de {BATCH_SIZE} fichiers...")
+            tree = api_call("POST", "/git/trees", {
+                "base_tree": base_tree_sha,
+                "tree": tree_items
+            })
+            if tree:
+                base_tree_sha = tree["sha"]
+                tree_items = []  # Reset pour le prochain lot
+            else:
+                print("[ERR] Échec de la création de l'arbre intermédiaire.")
+                return
+
+    # 3. Création de l'arbre final pour le reste
+    if tree_items:
+        print(f"[*] Création de l'arbre final ({len(tree_items)} fichiers)...")
+        tree = api_call("POST", "/git/trees", {
+            "base_tree": base_tree_sha,
+            "tree": tree_items
+        })
+        if tree:
+            base_tree_sha = tree["sha"]
+        else:
+            return
+
+    # 4. Création du commit
+    print("[*] Création du commit final...")
+    commit = api_call("POST", "/git/commits", {
+        "message": f"Nexus Bulk Upload X2 : {total_envoyes} fichiers",
+        "tree": base_tree_sha,
+        "parents": [parent_sha]
+    })
+    if not commit:
+        return
+
+    # 5. Mise à jour de la branche
+    print("[*] Mise à jour de la branche...")
+    update = api_call("PATCH", f"/git/refs/heads/{BRANCH}", {
+        "sha": commit["sha"]
+    })
+
+    if update:
+        print(f"\n\033[1;32m[OK] SUCCÈS : {total_envoyes} fichiers uploadés en 1 commit !\033[0m")
+        print(f"Commit SHA : {commit['sha'][:10]}")
+    else:
+        print("\033[1;31m[ERR] Échec de la mise à jour de la branche.\033[0m")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 nexus_bulk_uploader.py <archive.zip|tar.xz|tar.gz>")
+        sys.exit(1)
+
+    if not GITHUB_TOKEN or not GITHUB_USER:
+        print("[ERR] Définis les variables d'environnement GITHUB_TOKEN et GITHUB_USER.")
+        sys.exit(1)
+
+    archive_path = sys.argv[1]
+    if not os.path.exists(archive_path):
+        print(f"[ERR] Le fichier {archive_path} n'existe pas.")
+        sys.exit(1)
+
+    print(f"[*] Préparation de l'upload de {archive_path}...")
+    
+    # On passe le générateur directement à l'uploader (streaming)
+    uploader(extraire_archive(archive_path))
+
+if __name__ == "__main__":
+    main()
